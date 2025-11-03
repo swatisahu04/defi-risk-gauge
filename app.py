@@ -180,92 +180,184 @@ st.sidebar.info(
 # 2. Helper functions to call APIs
 # -----------------------------------------------------------
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased cache TTL to 10 minutes to reduce API calls
 def fetch_tvl(slug: str):
     """
-    Get protocol-level TVL from DeFiLlama.
+    Get protocol-level TVL from DeFiLlama with retry logic.
     Docs: https://defillama.com/docs/api
     """
     url = f"https://api.llama.fi/protocol/{slug}"
     logger.info(f"Fetching TVL data for protocol: {slug}")
     logger.debug(f"TVL API URL: {url}")
     
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        logger.debug(f"TVL API response status: {resp.status_code}")
-        
-        data = resp.json()
-        logger.debug(f"TVL API response keys: {list(data.keys())[:5]}...")  # Log first 5 keys
-        
-        # Data sometimes has 'tvl' as list over time; sometimes there is 'currentChainTvls'
-        if "tvl" in data and isinstance(data["tvl"], list) and len(data["tvl"]) > 0:
-            latest = data["tvl"][-1].get("totalLiquidityUSD", 0)
-            logger.info(f"Successfully fetched TVL for {slug}: ${latest:,.0f}")
-            return latest
-        elif "tvl" in data and isinstance(data["tvl"], (int, float)):
-            tvl_value = data["tvl"]
-            logger.info(f"Successfully fetched TVL for {slug} (direct value): ${tvl_value:,.0f}")
-            return tvl_value
-        else:
-            # fallback
-            fallback_value = data.get("tvl", 0)
-            logger.warning(f"Using fallback TVL value for {slug}: ${fallback_value:,.0f}")
-            return fallback_value
-    except requests.exceptions.Timeout as e:
-        logger.error(f"Timeout while fetching TVL for {slug}: {e}")
-        st.warning(f"Could not fetch TVL for {slug}: Request timeout")
-        return 0
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error while fetching TVL for {slug}: Status {e.response.status_code if hasattr(e, 'response') else 'unknown'}")
-        st.warning(f"Could not fetch TVL for {slug}: HTTP error")
-        return 0
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request exception while fetching TVL for {slug}: {type(e).__name__} - {str(e)}")
-        st.warning(f"Could not fetch TVL for {slug}: {e}")
-        return 0
-    except Exception as e:
-        logger.exception(f"Unexpected error processing TVL data for {slug}: {type(e).__name__} - {str(e)}")
-        st.warning(f"Error processing TVL data for {slug}: {e}")
-        return 0
+    # Retry logic for Streamlit Cloud
+    max_retries = 3
+    timeout = 30  # Increased timeout for Streamlit Cloud (was 10)
+    
+    headers = {
+        'User-Agent': 'DeFi-Risk-Gauge/1.0',
+        'Accept': 'application/json'
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"Attempt {attempt + 1}/{max_retries} for fetching TVL for {slug}")
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            
+            # Log response status before raising
+            logger.debug(f"TVL API response status: {resp.status_code}")
+            
+            # Check for non-2xx status codes before raising
+            if not resp.ok:
+                logger.warning(f"Non-OK response for {slug}: Status {resp.status_code}, Response: {resp.text[:200]}")
+            
+            resp.raise_for_status()
+            
+            data = resp.json()
+            logger.debug(f"TVL API response keys: {list(data.keys())[:5]}...")  # Log first 5 keys
+            
+            # Data sometimes has 'tvl' as list over time; sometimes there is 'currentChainTvls'
+            if "tvl" in data and isinstance(data["tvl"], list) and len(data["tvl"]) > 0:
+                latest = data["tvl"][-1].get("totalLiquidityUSD", 0)
+                logger.info(f"Successfully fetched TVL for {slug}: ${latest:,.0f}")
+                return latest
+            elif "tvl" in data and isinstance(data["tvl"], (int, float)):
+                tvl_value = data["tvl"]
+                logger.info(f"Successfully fetched TVL for {slug} (direct value): ${tvl_value:,.0f}")
+                return tvl_value
+            else:
+                # fallback
+                fallback_value = data.get("tvl", 0)
+                logger.warning(f"Using fallback TVL value for {slug}: ${fallback_value:,.0f}")
+                return fallback_value
+                
+        except requests.exceptions.Timeout as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f"Timeout while fetching TVL for {slug} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Timeout while fetching TVL for {slug} after {max_retries} attempts: {e}")
+                st.warning(f"Could not fetch TVL for {slug}: Request timeout after {max_retries} attempts. Please try again later.")
+                return 0
+        except requests.exceptions.HTTPError as e:
+            # Extract status code more reliably
+            try:
+                status_code = e.response.status_code if hasattr(e, 'response') and e.response is not None else None
+                response_text = e.response.text[:200] if hasattr(e, 'response') and e.response is not None else "No response text"
+                logger.error(f"HTTP error while fetching TVL for {slug}: Status {status_code}, Response: {response_text}")
+                
+                if status_code == 429:  # Rate limit
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt * 2  # Longer wait for rate limits
+                        logger.warning(f"Rate limited for {slug} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                elif status_code == 404:
+                    logger.error(f"Protocol {slug} not found (404). This may be a typo or removed protocol.")
+                    st.warning(f"Could not find protocol '{slug}'. Please check the protocol name.")
+                    return 0
+                elif status_code == 503 or status_code == 502:
+                    # Service unavailable or bad gateway - retry
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt * 2
+                        logger.warning(f"Service unavailable for {slug} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                
+                status_msg = f"HTTP {status_code}" if status_code else "HTTP error"
+                st.warning(f"Could not fetch TVL for {slug}: {status_msg}. Please try again later.")
+            except Exception as parse_error:
+                logger.error(f"Error parsing HTTP error for {slug}: {parse_error}. Original error: {e}")
+                st.warning(f"Could not fetch TVL for {slug}: HTTP error. Please try again later.")
+            return 0
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Connection error for {slug} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Connection error while fetching TVL for {slug} after {max_retries} attempts: {e}")
+                st.warning(f"Could not fetch TVL for {slug}: Connection error. Please check your internet connection.")
+                return 0
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request exception while fetching TVL for {slug}: {type(e).__name__} - {str(e)}")
+            st.warning(f"Could not fetch TVL for {slug}: {e}")
+            return 0
+        except Exception as e:
+            logger.exception(f"Unexpected error processing TVL data for {slug}: {type(e).__name__} - {str(e)}")
+            st.warning(f"Error processing TVL data for {slug}: {e}")
+            return 0
+    
+    logger.error(f"Failed to fetch TVL for {slug} after {max_retries} attempts")
+    return 0
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased cache TTL to 10 minutes
 def fetch_tvl_history(slug: str):
-    """Fetch historical TVL data for charting"""
+    """Fetch historical TVL data for charting with retry logic"""
     url = f"https://api.llama.fi/protocol/{slug}"
     logger.info(f"Fetching TVL history for protocol: {slug}")
     
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        logger.debug(f"TVL history API response status: {resp.status_code}")
-        
-        data = resp.json()
-        if "tvl" in data and isinstance(data["tvl"], list):
-            df = pd.DataFrame(data["tvl"])
-            logger.debug(f"TVL history data shape: {df.shape}, columns: {list(df.columns)}")
+    max_retries = 3
+    timeout = 30  # Increased timeout for Streamlit Cloud
+    
+    headers = {
+        'User-Agent': 'DeFi-Risk-Gauge/1.0',
+        'Accept': 'application/json'
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"Attempt {attempt + 1}/{max_retries} for fetching TVL history for {slug}")
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            resp.raise_for_status()
+            logger.debug(f"TVL history API response status: {resp.status_code}")
             
-            if "date" in df.columns and "totalLiquidityUSD" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], unit="s")
-                logger.info(f"Successfully fetched TVL history for {slug}: {len(df)} data points")
-                return df[["date", "totalLiquidityUSD"]].rename(columns={"totalLiquidityUSD": "TVL (USD)"})
+            data = resp.json()
+            if "tvl" in data and isinstance(data["tvl"], list):
+                df = pd.DataFrame(data["tvl"])
+                logger.debug(f"TVL history data shape: {df.shape}, columns: {list(df.columns)}")
+                
+                if "date" in df.columns and "totalLiquidityUSD" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"], unit="s")
+                    logger.info(f"Successfully fetched TVL history for {slug}: {len(df)} data points")
+                    return df[["date", "totalLiquidityUSD"]].rename(columns={"totalLiquidityUSD": "TVL (USD)"})
+                else:
+                    logger.warning(f"Missing required columns in TVL history for {slug}. Available: {list(df.columns)}")
+                    return None
             else:
-                logger.warning(f"Missing required columns in TVL history for {slug}. Available: {list(df.columns)}")
+                logger.warning(f"No TVL history list found in response for {slug}")
                 return None
-        else:
-            logger.warning(f"No TVL history list found in response for {slug}")
+        except requests.exceptions.Timeout as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Timeout while fetching TVL history for {slug} (attempt {attempt + 1}/{max_retries}). Retrying...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Timeout while fetching TVL history for {slug} after {max_retries} attempts")
+                return None
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Request error for {slug} history (attempt {attempt + 1}/{max_retries}). Retrying...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Request exception while fetching TVL history for {slug}: {type(e).__name__} - {str(e)}")
+                return None
+        except Exception as e:
+            logger.exception(f"Unexpected error fetching TVL history for {slug}: {type(e).__name__} - {str(e)}")
             return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request exception while fetching TVL history for {slug}: {type(e).__name__} - {str(e)}")
-        return None
-    except Exception as e:
-        logger.exception(f"Unexpected error fetching TVL history for {slug}: {type(e).__name__} - {str(e)}")
-        return None
+    
+    return None
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased cache TTL to 10 minutes
 def fetch_volatility(coingecko_id: str):
     """
-    Fetch comprehensive volatility and market data from CoinGecko.
+    Fetch comprehensive volatility and market data from CoinGecko with retry logic.
     Docs: https://www.coingecko.com/en/api/documentation
     """
     url = f"https://api.coingecko.com/api/v3/coins/{coingecko_id}"
@@ -280,53 +372,108 @@ def fetch_volatility(coingecko_id: str):
     logger.info(f"Fetching volatility data for CoinGecko ID: {coingecko_id}")
     logger.debug(f"CoinGecko API URL: {url}")
     
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        logger.debug(f"CoinGecko API response status: {resp.status_code}")
-        
-        data = resp.json()
-        market_data = data.get("market_data", {})
-        
-        if not market_data:
-            logger.warning(f"No market_data found in CoinGecko response for {coingecko_id}")
-        
-        vol_24h = abs(market_data.get("price_change_percentage_24h", 0) or 0)
-        vol_7d = abs(market_data.get("price_change_percentage_7d", 0) or 0)
-        current_price = market_data.get("current_price", {}).get("usd", 0) if isinstance(market_data.get("current_price"), dict) else market_data.get("current_price", 0)
-        market_cap = market_data.get("market_cap", {}).get("usd", 0) if isinstance(market_data.get("market_cap"), dict) else market_data.get("market_cap", 0)
-        
-        # Composite volatility (weighted)
-        composite_vol = (vol_24h * 0.7) + (vol_7d * 0.3 / 7)
-        
-        logger.info(f"Successfully fetched volatility data for {coingecko_id}: "
-                   f"24h={vol_24h:.2f}%, 7d={vol_7d:.2f}%, composite={composite_vol:.2f}%, "
-                   f"price=${current_price:.4f}, market_cap=${market_cap:,.0f}")
-        
-        return {
-            "volatility_24h": vol_24h,
-            "volatility_7d": vol_7d,
-            "composite_volatility": composite_vol,
-            "current_price": current_price,
-            "market_cap": market_cap
-        }
-    except requests.exceptions.Timeout as e:
-        logger.error(f"Timeout while fetching volatility for {coingecko_id}: {e}")
-        st.warning(f"Could not fetch volatility for {coingecko_id}: Request timeout")
-        return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code if hasattr(e, 'response') and e.response else 'unknown'
-        logger.error(f"HTTP error while fetching volatility for {coingecko_id}: Status {status_code}")
-        st.warning(f"Could not fetch volatility for {coingecko_id}: HTTP error")
-        return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request exception while fetching volatility for {coingecko_id}: {type(e).__name__} - {str(e)}")
-        st.warning(f"Could not fetch volatility for {coingecko_id}: {e}")
-        return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
-    except Exception as e:
-        logger.exception(f"Unexpected error processing volatility data for {coingecko_id}: {type(e).__name__} - {str(e)}")
-        st.warning(f"Error processing volatility data for {coingecko_id}: {e}")
-        return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+    max_retries = 3
+    timeout = 30  # Increased timeout for Streamlit Cloud
+    
+    headers = {
+        'User-Agent': 'DeFi-Risk-Gauge/1.0',
+        'Accept': 'application/json'
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"Attempt {attempt + 1}/{max_retries} for fetching volatility for {coingecko_id}")
+            resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+            resp.raise_for_status()
+            logger.debug(f"CoinGecko API response status: {resp.status_code}")
+            
+            data = resp.json()
+            market_data = data.get("market_data", {})
+            
+            if not market_data:
+                logger.warning(f"No market_data found in CoinGecko response for {coingecko_id}")
+            
+            vol_24h = abs(market_data.get("price_change_percentage_24h", 0) or 0)
+            vol_7d = abs(market_data.get("price_change_percentage_7d", 0) or 0)
+            current_price = market_data.get("current_price", {}).get("usd", 0) if isinstance(market_data.get("current_price"), dict) else market_data.get("current_price", 0)
+            market_cap = market_data.get("market_cap", {}).get("usd", 0) if isinstance(market_data.get("market_cap"), dict) else market_data.get("market_cap", 0)
+            
+            # Composite volatility (weighted)
+            composite_vol = (vol_24h * 0.7) + (vol_7d * 0.3 / 7)
+            
+            logger.info(f"Successfully fetched volatility data for {coingecko_id}: "
+                       f"24h={vol_24h:.2f}%, 7d={vol_7d:.2f}%, composite={composite_vol:.2f}%, "
+                       f"price=${current_price:.4f}, market_cap=${market_cap:,.0f}")
+            
+            return {
+                "volatility_24h": vol_24h,
+                "volatility_7d": vol_7d,
+                "composite_volatility": composite_vol,
+                "current_price": current_price,
+                "market_cap": market_cap
+            }
+        except requests.exceptions.Timeout as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Timeout while fetching volatility for {coingecko_id} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Timeout while fetching volatility for {coingecko_id} after {max_retries} attempts: {e}")
+                st.warning(f"Could not fetch volatility for {coingecko_id}: Request timeout after {max_retries} attempts. Please try again later.")
+                return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+        except requests.exceptions.HTTPError as e:
+            # Extract status code more reliably
+            try:
+                status_code = e.response.status_code if hasattr(e, 'response') and e.response is not None else None
+                response_text = e.response.text[:200] if hasattr(e, 'response') and e.response is not None else "No response text"
+                logger.error(f"HTTP error while fetching volatility for {coingecko_id}: Status {status_code}, Response: {response_text}")
+                
+                if status_code == 429:  # Rate limit
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt * 2
+                        logger.warning(f"Rate limited for {coingecko_id} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                elif status_code == 404:
+                    logger.error(f"Coin {coingecko_id} not found (404). This may be a typo or removed coin.")
+                    st.warning(f"Could not find coin '{coingecko_id}'. Please check the coin ID.")
+                    return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+                elif status_code == 503 or status_code == 502:
+                    # Service unavailable or bad gateway - retry
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt * 2
+                        logger.warning(f"Service unavailable for {coingecko_id} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                
+                status_msg = f"HTTP {status_code}" if status_code else "HTTP error"
+                st.warning(f"Could not fetch volatility for {coingecko_id}: {status_msg}. Please try again later.")
+            except Exception as parse_error:
+                logger.error(f"Error parsing HTTP error for {coingecko_id}: {parse_error}. Original error: {e}")
+                st.warning(f"Could not fetch volatility for {coingecko_id}: HTTP error. Please try again later.")
+            return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Connection error for {coingecko_id} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Connection error while fetching volatility for {coingecko_id} after {max_retries} attempts: {e}")
+                st.warning(f"Could not fetch volatility for {coingecko_id}: Connection error. Please check your internet connection.")
+                return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request exception while fetching volatility for {coingecko_id}: {type(e).__name__} - {str(e)}")
+            st.warning(f"Could not fetch volatility for {coingecko_id}: {e}")
+            return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+        except Exception as e:
+            logger.exception(f"Unexpected error processing volatility data for {coingecko_id}: {type(e).__name__} - {str(e)}")
+            st.warning(f"Error processing volatility data for {coingecko_id}: {e}")
+            return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
+    
+    logger.error(f"Failed to fetch volatility for {coingecko_id} after {max_retries} attempts")
+    return {"volatility_24h": 0, "volatility_7d": 0, "composite_volatility": 0, "current_price": 0, "market_cap": 0}
 
 # -----------------------------------------------------------
 # 3. Fetch data
