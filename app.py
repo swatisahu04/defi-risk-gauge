@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import time
 import logging
 import os
+import re
 from pathlib import Path
 
 # -----------------------------------------------------------
@@ -105,7 +106,7 @@ PROTOCOLS = {
         "description": "Largest decentralized exchange (DEX)"
     },
     "Curve": {
-        "defillama_slug": "curve",
+        "defillama_slug": "curve-finance",
         "coingecko_id": "curve-dao-token",
         "audit_score": 0.82,
         "description": "Stablecoin and pegged asset exchange"
@@ -117,7 +118,7 @@ PROTOCOLS = {
         "description": "Liquid staking protocol for Ethereum"
     },
     "Compound": {
-        "defillama_slug": "compound",
+        "defillama_slug": "compound-v3",
         "coingecko_id": "compound-governance-token",
         "audit_score": 0.83,
         "description": "Algorithmic money market protocol"
@@ -160,10 +161,10 @@ if compare_mode:
     logger.info("Comparison mode enabled")
 
 # Auto-refresh
-auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=False)
+auto_refresh = st.sidebar.checkbox("Auto-refresh (2m)", value=False)
 if auto_refresh:
-    logger.info("Auto-refresh enabled, waiting 30 seconds...")
-    time.sleep(30)
+    logger.info("Auto-refresh enabled, waiting 2 minutes...")
+    time.sleep(120)  # 2 minutes = 120 seconds
     logger.info("Auto-refresh triggered, reloading app...")
     st.rerun()
 
@@ -171,16 +172,14 @@ if auto_refresh:
 st.sidebar.markdown("---")
 st.sidebar.header("About this app")
 st.sidebar.info(
-    "This DeFi Risk Gauge demonstrates how public on-chain analytics "
-    "can be combined with market-risk thinking from TradFi (liquidity, volatility, audit). "
-    "Built in Streamlit for rapid prototyping (vibe coding)."
+    "This DeFi Risk Gauge demonstrates how public on-chain analytics can be combined with market-risk thinking from TradFi (liquidity, volatility, audit)."
 )
 
 # -----------------------------------------------------------
 # 2. Helper functions to call APIs
 # -----------------------------------------------------------
 
-@st.cache_data(ttl=600, show_spinner=False)  # Increased cache TTL to 10 minutes to reduce API calls
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=50)  # Cache for 1 hour to reduce API calls and timeouts
 def fetch_tvl(slug: str, delay_before_request: float = 0):
     """
     Get protocol-level TVL from DeFiLlama with retry logic.
@@ -332,7 +331,7 @@ def fetch_tvl(slug: str, delay_before_request: float = 0):
     logger.error(f"Failed to fetch TVL for {slug} after {max_retries} attempts")
     return 0
 
-@st.cache_data(ttl=600, show_spinner=False)  # Increased cache TTL to 10 minutes
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=50)  # Cache for 1 hour to reduce API calls and timeouts
 def fetch_tvl_history(slug: str):
     """Fetch historical TVL data for charting with retry logic"""
     url = f"https://api.llama.fi/protocol/{slug}"
@@ -392,7 +391,7 @@ def fetch_tvl_history(slug: str):
     
     return None
 
-@st.cache_data(ttl=600, show_spinner=False)  # Increased cache TTL to 10 minutes
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=50)  # Cache for 1 hour to reduce API calls and timeouts
 def fetch_volatility(coingecko_id: str, delay_before_request: float = 0):
     """
     Fetch comprehensive volatility and market data from CoinGecko with retry logic.
@@ -634,6 +633,18 @@ def format_percent(value):
     else:
         return f"({abs(value):.2f}%)"
 
+# Format TVL with abbreviations to avoid overflow
+def format_tvl(value):
+    """Format TVL with abbreviations (B for billions, M for millions, K for thousands)"""
+    if value >= 1e9:
+        return f"${value/1e9:.2f}B"
+    elif value >= 1e6:
+        return f"${value/1e6:.2f}M"
+    elif value >= 1e3:
+        return f"${value/1e3:.2f}K"
+    else:
+        return f"${value:,.0f}"
+
 with col_gauge:
     st.subheader("Risk Score")
     
@@ -665,7 +676,7 @@ with col_gauge:
         mode = "gauge+number+delta",
         value = risk_score,
         domain = {'x': [0, 1], 'y': [0, 1]},
-        title = {'text': f"<b>Risk Score</b><br><span style='font-size:0.8em'>{risk_level}</span>", 'font': {'size': 20}},
+        title = {'text': ""},
         delta = {
             'reference': reference,
             'position': "top",
@@ -715,29 +726,108 @@ with col_gauge:
     
     fig_gauge.update_layout(
         height=400,
+        title="Overall Risk Score",  # Match format of "Component Risk Scores"
+        title_font_size=16,
         margin=dict(l=20, r=20, t=80, b=60),  # Increased bottom margin for subtitle
-        paper_bgcolor="white",
-        annotations=[
-            dict(
-                text=f"vs. Midpoint (50): {delta_display}",
-                x=0.5,
-                y=-0.1,
-                xref="paper",
-                yref="paper",
-                showarrow=False,
-                font=dict(size=12, color="gray")
-            )
-        ]
+        paper_bgcolor="white"
     )
     
     st.plotly_chart(fig_gauge, use_container_width=True)
     
-    # Risk level badge
-    st.markdown(f"""
-    <div class="risk-badge" style="background-color: {color}20; color: {color}; border: 2px solid {color};">
-        {risk_level} — {risk_score:.1f}
-    </div>
-    """, unsafe_allow_html=True)
+    # Calculate component contributions for tooltip
+    vol_risk_normalized = min(composite_vol / 100.0, 1.0) if composite_vol > 0 else 0
+    market_risk_contrib = vol_risk_normalized * 40
+    
+    # TVL risk factor based on tiers
+    if tvl_usd >= 1e9:
+        tvl_risk_factor = 0.2
+        tvl_tier = "High (>$1B)"
+    elif tvl_usd >= 100e6:
+        tvl_risk_factor = 0.4
+        tvl_tier = "Medium ($100M-$1B)"
+    elif tvl_usd >= 10e6:
+        tvl_risk_factor = 0.6
+        tvl_tier = "Low-Medium ($10M-$100M)"
+    else:
+        tvl_risk_factor = 0.8
+        tvl_tier = "Low (<$10M)"
+    
+    liquidity_risk_contrib = tvl_risk_factor * 30
+    protocol_risk_factor = 1.0 - audit_score
+    protocol_risk_contrib = protocol_risk_factor * 30
+    
+    # Risk level badge below gauge with info icon
+    st.markdown(
+        f"""
+        <style>
+        .risk-info-icon {{
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            line-height: 16px;
+            text-align: center;
+            border-radius: 50%;
+            background-color: #17a2b8;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: help;
+            position: relative;
+            margin-left: 5px;
+            vertical-align: middle;
+        }}
+        .risk-info-icon:hover .risk-tooltip-text {{
+            visibility: visible;
+            opacity: 1;
+        }}
+        .risk-tooltip-text {{
+            visibility: hidden;
+            width: 350px;
+            background-color: #333;
+            color: #fff;
+            text-align: left;
+            border-radius: 6px;
+            padding: 12px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -175px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+            font-weight: normal;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }}
+        .risk-tooltip-text::after {{
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }}
+        </style>
+        <div style="margin-top: 10px;">
+            <div style="width: 100%; background-color: {color}20; color: {color}; border: 2px solid {color}; padding: 12px; border-radius: 5px; font-weight: 500; text-align: center; box-sizing: border-box;">
+                {risk_level} — {risk_score:.1f}
+                <span class="risk-info-icon" title="Risk Score Calculation">ℹ️
+                    <span class="risk-tooltip-text">
+                        <b>Risk Score Formula:</b><br><br>
+                        <b>Market Risk (40%):</b> {market_risk_contrib:.1f} pts<br>
+                        <b>Liquidity Risk (30%):</b> {liquidity_risk_contrib:.1f} pts<br>
+                        <b>Protocol Risk (30%):</b> {protocol_risk_contrib:.1f} pts<br><br>
+                        <b>= {risk_score:.1f} pts</b> (shown on gauge above)<br><br>
+                        🟢 Low (0-30) | 🟡 Moderate (30-60) | 🔴 High (60-100)
+                    </span>
+                </span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 with col_info:
     st.subheader("Risk Breakdown")
@@ -762,12 +852,11 @@ with col_info:
         "Weight": ["40%", "30%", "30%"]
     })
     
-    # Create horizontal bar chart
+    # Create vertical bar chart for better understanding
     fig_breakdown = px.bar(
         breakdown_data,
-        x="Risk Score",
-        y="Component",
-        orientation='h',
+        x="Component",
+        y="Risk Score",
         color="Risk Score",
         color_continuous_scale=["green", "yellow", "red"],
         title="Component Risk Scores",
@@ -778,13 +867,14 @@ with col_info:
     fig_breakdown.update_traces(
         texttemplate='%{text:.1f}',
         textposition='outside',
-        marker=dict(line=dict(color='darkgray', width=1))
+        marker=dict(line=dict(color='darkgray', width=1)),
+        textfont=dict(size=12)
     )
     
     fig_breakdown.update_layout(
         height=400,
-        xaxis=dict(range=[0, 100], title="Risk Score (0-100)"),
-        yaxis=dict(title=""),
+        xaxis=dict(title="", tickangle=0),
+        yaxis=dict(range=[0, 100], title="Risk Score (0-100)"),
         showlegend=False,
         margin=dict(l=20, r=20, t=60, b=20),
         paper_bgcolor="white",
@@ -811,11 +901,71 @@ with col_info:
     
     st.markdown(
         f"""
-        <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px;">
-            <strong>Delta Change:</strong> {delta_display} {delta_sign}<br>
-            <small style="color: {delta_color};">
-                {delta_meaning} vs. midpoint (50)
-            </small>
+        <style>
+        .delta-info-icon {{
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            line-height: 16px;
+            text-align: center;
+            border-radius: 50%;
+            background-color: #17a2b8;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: help;
+            position: relative;
+            margin-left: 5px;
+            vertical-align: middle;
+        }}
+        .delta-info-icon:hover .delta-tooltip-text {{
+            visibility: visible;
+            opacity: 1;
+        }}
+        .delta-tooltip-text {{
+            visibility: hidden;
+            width: 300px;
+            background-color: #333;
+            color: #fff;
+            text-align: left;
+            border-radius: 6px;
+            padding: 12px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -150px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+            font-weight: normal;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }}
+        .delta-tooltip-text::after {{
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }}
+        </style>
+        <div style="width: 100%; background-color: #f8f9fa; padding: 12px; border-radius: 5px; margin-top: 10px; border: 2px solid {delta_color}; text-align: center; box-sizing: border-box;">
+            <span style="font-weight: 500;">
+                <strong>Delta Change:</strong> {delta_display} {delta_sign} — {delta_meaning} vs. midpoint (50)
+            </span>
+            <span class="delta-info-icon" title="Delta Calculation">ℹ️
+                <span class="delta-tooltip-text">
+                    <b>How is Delta Calculated?</b><br>
+                    Delta = (Current Risk Score - Reference Value) / Reference Value × 100%<br><br>
+                    <b>Current Risk Score:</b> {risk_score:.1f} pts<br>
+                    <b>Reference Value:</b> 50 pts (Midpoint)<br>
+                    <b>Calculation:</b> ({risk_score:.1f} - 50) / 50 × 100% = {delta_display}<br><br>
+                    The delta shows the percentage change from the neutral midpoint of 50 points.
+                </span>
+            </span>
         </div>
         """,
         unsafe_allow_html=True
@@ -829,7 +979,7 @@ st.subheader("📈 Additional Metrics")
 
 col1, col2, col3, col4 = st.columns(4)
 
-col1.metric("TVL (USD)", f"${tvl_usd:,.0f}", help="Total Value Locked in the protocol")
+col1.metric("TVL (USD)", format_tvl(tvl_usd), help="Total Value Locked in the protocol")
 col2.metric("24h Volatility", format_percent(vol_24h), help="24-hour price change percentage")
 col3.metric("7d Volatility", format_percent(vol_7d), help="7-day price change percentage")
 col4.metric("Audit Score", f"{audit_score:.2f}", help="Security audit score (0.0 = lowest, 1.0 = highest)")
@@ -873,28 +1023,185 @@ st.subheader("🔬 Scenario Analysis: Volatility Shock")
 vol_scenarios = [composite_vol * m for m in [0.5, 1, 1.5, 2, 3]]
 risk_values = [compute_risk_score(tvl_usd, v, audit_score) for v in vol_scenarios]
 
-scenario_data = pd.DataFrame({
+# Create DataFrame with numeric values for chart
+scenario_chart_data = pd.DataFrame({
     "Volatility Multiplier": ["0.5x", "1x", "1.5x", "2x", "3x"],
-    "Volatility (%)": [f"{v:.2f}" for v in vol_scenarios],
-    "Risk Score": [f"{r:.1f}" for r in risk_values]
+    "Risk Score": risk_values  # Numeric values for charting
 })
 
-col_chart, col_table = st.columns([2, 1])
+col_chart, col_table = st.columns([1, 1])
 
 with col_chart:
+    # Add tooltip for line chart
+    st.markdown(
+        """
+        <style>
+        .scenario-info-icon {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            line-height: 16px;
+            text-align: center;
+            border-radius: 50%;
+            background-color: #17a2b8;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: help;
+            position: relative;
+            margin-left: 5px;
+            vertical-align: middle;
+        }
+        .scenario-info-icon:hover .scenario-tooltip-text {
+            visibility: visible;
+            opacity: 1;
+        }
+        .scenario-tooltip-text {
+            visibility: hidden;
+            width: 300px;
+            background-color: #333;
+            color: #fff;
+            text-align: left;
+            border-radius: 6px;
+            padding: 12px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -150px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+            font-weight: normal;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        .scenario-tooltip-text::after {
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }
+        </style>
+        <div style="margin-bottom: 10px; padding-bottom: 5px;">
+            <span style="font-weight: 600; font-size: 16px;">Risk Score Sensitivity to Volatility Changes</span>
+            <span class="scenario-info-icon" title="Chart Explanation">ℹ️
+                <span class="scenario-tooltip-text">
+                    <b>Chart Explanation:</b><br>
+                    This line chart shows how the risk score changes as volatility increases or decreases from the current level (1x baseline), demonstrating the protocol's sensitivity to market volatility shocks.
+                </span>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
     fig_scenario = px.line(
         x=vol_scenarios,
         y=risk_values,
         markers=True,
-        title="Risk Score Sensitivity to Volatility Changes",
+        title="",  # Remove title as we added it above with tooltip
         labels={"x": "Volatility (%)", "y": "Risk Score (0-100)"}
     )
-    fig_scenario.update_layout(height=400)
+    fig_scenario.update_layout(
+        height=400,
+        margin=dict(l=20, r=20, t=20, b=20),
+        paper_bgcolor="white"
+    )
     st.plotly_chart(fig_scenario, use_container_width=True)
 
 with col_table:
-    st.write("**Scenario Results**")
-    st.dataframe(scenario_data, use_container_width=True, hide_index=True)
+    # Add tooltip for bar chart
+    st.markdown(
+        """
+        <style>
+        .scenario-bar-info-icon {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            line-height: 16px;
+            text-align: center;
+            border-radius: 50%;
+            background-color: #17a2b8;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: help;
+            position: relative;
+            margin-left: 5px;
+            vertical-align: middle;
+        }
+        .scenario-bar-info-icon:hover .scenario-bar-tooltip-text {
+            visibility: visible;
+            opacity: 1;
+        }
+        .scenario-bar-tooltip-text {
+            visibility: hidden;
+            width: 300px;
+            background-color: #333;
+            color: #fff;
+            text-align: left;
+            border-radius: 6px;
+            padding: 12px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -150px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+            font-weight: normal;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        .scenario-bar-tooltip-text::after {
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }
+        </style>
+        <div style="margin-bottom: 10px; padding-bottom: 5px;">
+            <span style="font-weight: 600; font-size: 16px;">Scenario Results</span>
+            <span class="scenario-bar-info-icon" title="Chart Explanation">ℹ️
+                <span class="scenario-bar-tooltip-text">
+                    <b>Chart Explanation:</b><br>
+                    This bar chart displays the calculated risk scores for different volatility multiplier scenarios (0.5x to 3x current volatility), showing how each shock level impacts the overall risk assessment.
+                </span>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    # Create a bar chart for scenario results
+    fig_scenario_table = px.bar(
+        scenario_chart_data,
+        x="Volatility Multiplier",
+        y="Risk Score",
+        color="Risk Score",
+        color_continuous_scale=["green", "yellow", "red"],
+        title="",  # Remove title as we added it above with tooltip
+        labels={"Risk Score": "Risk Score (0-100)", "Volatility Multiplier": ""},
+        text="Risk Score"
+    )
+    fig_scenario_table.update_traces(
+        texttemplate='%{text:.1f}',
+        textposition='outside',
+        marker=dict(line=dict(color='darkgray', width=1))
+    )
+    fig_scenario_table.update_layout(
+        height=400,
+        margin=dict(l=20, r=20, t=20, b=20),
+        paper_bgcolor="white",
+        showlegend=False
+    )
+    st.plotly_chart(fig_scenario_table, use_container_width=True)
 
 # -----------------------------------------------------------
 # 10. Protocol Comparison (if enabled)
@@ -906,7 +1213,7 @@ if compare_mode:
     selected_protocols = st.multiselect(
         "Select protocols to compare",
         [p for p in PROTOCOLS.keys() if p != protocol_name],
-        default=[p for p in list(PROTOCOLS.keys())[:3] if p != protocol_name]
+        default=["Lido"] if "Lido" != protocol_name else []
     )
     
     if selected_protocols:
@@ -930,7 +1237,13 @@ if compare_mode:
                 try:
                     # Fetch TVL with longer delay between calls to avoid rate limiting
                     # First protocol already fetched, but add delay for subsequent ones
-                    if idx > 0:
+                    # Balancer and Uniswap often take longer - add extra delay for them
+                    slow_protocols = ["Balancer", "Uniswap"]
+                    if proto_name in slow_protocols:
+                        # Add extra delay for slow protocols
+                        delay_tvl = 5.0 + (idx * 1.0) if idx > 0 else 3.0  # 3s for first, 5s+ for subsequent
+                        logger.debug(f"Adding extra {delay_tvl}s delay before TVL request for slow protocol: {proto_name}")
+                    elif idx > 0:
                         delay_tvl = 2.5 + (idx * 0.5)  # Progressive delay: 2.5s, 3s, 3.5s, etc.
                         logger.debug(f"Adding {delay_tvl}s delay before TVL request for {proto_name}")
                     else:
@@ -939,7 +1252,12 @@ if compare_mode:
                     comp_tvl = fetch_tvl(proto["defillama_slug"], delay_before_request=delay_tvl)
                     
                     # Add delay before volatility call to avoid rate limiting
-                    time.sleep(2)  # Increased from 1s to 2s
+                    # Extra delay for slow protocols (Balancer, Uniswap)
+                    if proto_name in slow_protocols:
+                        time.sleep(3)  # Extra delay for slow protocols: 3s instead of 2s
+                        logger.debug(f"Adding extra 3s delay before volatility request for slow protocol: {proto_name}")
+                    else:
+                        time.sleep(2)  # Standard delay: 2s
                     comp_vol = fetch_volatility(proto["coingecko_id"], delay_before_request=1.0)  # Increased from 0.5s to 1s
                     
                     # Validate data before proceeding
@@ -987,8 +1305,43 @@ if compare_mode:
                     skipped_count = len(all_protocols) - len(comparison_data)
                     st.info(f"✅ Showing {len(comparison_data)} protocols. {skipped_count} protocol(s) skipped due to API errors.")
                 
-                # Display comparison table
-                st.dataframe(comp_df, use_container_width=True, hide_index=True)
+                # Display comparison table with center alignment for all rows and columns
+                # Format TVL values for display
+                # Reset index to avoid showing row numbers (0, 1, 2, 3...)
+                comp_display_df = comp_df.copy().reset_index(drop=True)
+                if "TVL (USD)" in comp_display_df.columns:
+                    comp_display_df["TVL (USD)"] = comp_display_df["TVL (USD)"].apply(lambda x: format_tvl(x))
+                
+                # Format numeric columns
+                if "Risk Score" in comp_display_df.columns:
+                    comp_display_df["Risk Score"] = comp_display_df["Risk Score"].apply(lambda x: f"{x:.1f}")
+                if "24h Volatility (%)" in comp_display_df.columns:
+                    comp_display_df["24h Volatility (%)"] = comp_display_df["24h Volatility (%)"].apply(lambda x: format_percent(x))
+                if "Audit Score" in comp_display_df.columns:
+                    comp_display_df["Audit Score"] = comp_display_df["Audit Score"].apply(lambda x: f"{x:.2f}")
+                
+                # Apply center alignment styling to all headers and cells
+                # Build table styles list
+                table_styles = [
+                    {'selector': 'th', 'props': [('text-align', 'center'), ('font-weight', 'bold'), ('padding', '12px')]},
+                    {'selector': 'td', 'props': [('text-align', 'center'), ('padding', '12px')]},
+                    {'selector': 'table', 'props': [('width', '100%'), ('margin', '0 auto'), ('display', 'table'), ('border-collapse', 'collapse'), ('table-layout', 'auto')]}
+                ]
+                
+                # Hide index column - use hide() method for newer pandas or CSS for older versions
+                try:
+                    styled_df = comp_display_df.style.set_table_styles(table_styles).hide(axis="index")
+                except (AttributeError, TypeError):
+                    # Fallback: use CSS to hide index (for older pandas versions)
+                    table_styles.extend([
+                        {'selector': 'thead th:first-child', 'props': [('display', 'none')]},
+                        {'selector': 'tbody th', 'props': [('display', 'none')]}
+                    ])
+                    styled_df = comp_display_df.style.set_table_styles(table_styles)
+                
+                # Use Streamlit's native rendering for styled dataframes
+                # st.write() properly handles pandas Styler objects
+                st.write(styled_df)
                 
                 # Comparison chart
                 fig_compare = px.bar(
