@@ -217,7 +217,14 @@ def fetch_tvl(slug: str, delay_before_request: float = 0):
             
             # Check for non-2xx status codes before raising
             if not resp.ok:
-                logger.warning(f"Non-OK response for {slug}: Status {resp.status_code}, Response: {resp.text[:200]}")
+                error_response = resp.text[:500] if resp.text else "No response body"
+                logger.warning(f"Non-OK response for {slug}: Status {resp.status_code}, Response: {error_response}")
+                
+                # For HTTP 400, don't retry - it's likely a bad request format
+                if resp.status_code == 400:
+                    logger.error(f"HTTP 400 Bad Request for {slug}. This may indicate incorrect protocol slug. URL: {url}")
+                    st.warning(f"Could not fetch TVL for {slug}: Bad request (HTTP 400). Protocol slug may be incorrect.")
+                    return 0
             
             resp.raise_for_status()
             
@@ -253,8 +260,8 @@ def fetch_tvl(slug: str, delay_before_request: float = 0):
             # Extract status code more reliably
             try:
                 status_code = e.response.status_code if hasattr(e, 'response') and e.response is not None else None
-                response_text = e.response.text[:200] if hasattr(e, 'response') and e.response is not None else "No response text"
-                logger.error(f"HTTP error while fetching TVL for {slug}: Status {status_code}, Response: {response_text}")
+                response_text = e.response.text[:500] if hasattr(e, 'response') and e.response is not None and e.response.text else "No response text"
+                logger.error(f"HTTP error while fetching TVL for {slug}: Status {status_code}, URL: {url}, Response: {response_text}")
                 
                 if status_code == 429:  # Rate limit
                     if attempt < max_retries - 1:
@@ -262,15 +269,38 @@ def fetch_tvl(slug: str, delay_before_request: float = 0):
                         logger.warning(f"Rate limited for {slug} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
                         time.sleep(wait_time)
                         continue
+                elif status_code == 400:  # Bad request
+                    # HTTP 400 might also indicate rate limiting in some APIs
+                    # Log full error for debugging
+                    logger.error(f"HTTP 400 Bad Request for {slug}. URL: {url}, Response: {response_text}")
+                    
+                    # If it's in comparison mode, might be rate limiting - try once more with longer delay
+                    if "rate limit" in response_text.lower() or "too many" in response_text.lower():
+                        if attempt < max_retries - 1:
+                            wait_time = 5 + (attempt * 2)  # Longer wait: 5s, 7s, 9s
+                            logger.warning(f"Possible rate limit (400) for {slug} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                    
+                    # Otherwise, don't retry - likely wrong slug or API format issue
+                    st.warning(f"Could not fetch TVL for {slug}: Bad request (HTTP 400). The protocol slug may be incorrect or the API format may have changed.")
+                    return 0  # Don't retry 400 errors
                 elif status_code == 404:
-                    logger.error(f"Protocol {slug} not found (404). This may be a typo or removed protocol.")
+                    logger.error(f"Protocol {slug} not found (404). This may be a typo or removed protocol. URL: {url}")
                     st.warning(f"Could not find protocol '{slug}'. Please check the protocol name.")
-                    return 0
+                    return 0  # Don't retry 404 errors
                 elif status_code == 503 or status_code == 502:
                     # Service unavailable or bad gateway - retry
                     if attempt < max_retries - 1:
                         wait_time = 2 ** attempt * 2
                         logger.warning(f"Service unavailable for {slug} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                elif status_code == 500:
+                    # Server error - retry
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt * 2
+                        logger.warning(f"Server error for {slug} (attempt {attempt + 1}/{max_retries}). Waiting {wait_time}s...")
                         time.sleep(wait_time)
                         continue
                 
@@ -575,9 +605,28 @@ risk_score = compute_risk_score(tvl_usd, composite_vol, audit_score)
 logger.info(f"Final risk score for {protocol_name}: {risk_score:.2f}")
 
 # -----------------------------------------------------------
-# 5. Display main metrics
+# 5. Display main product characteristics at the top
 # -----------------------------------------------------------
-col1, col2, col3, col4 = st.columns(4)
+st.subheader("📊 Main Characteristics")
+
+col_price, col_mcap = st.columns(2)
+
+with col_price:
+    st.metric("Current Price", f"${current_price:.4f}", help="Current token price in USD")
+
+with col_mcap:
+    if market_cap > 0:
+        st.metric("Market Cap", f"${market_cap:,.0f}", help="Total market capitalization in USD")
+    else:
+        st.metric("Market Cap", "N/A", help="Market cap data not available")
+
+# -----------------------------------------------------------
+# 6. Risk score display with gauge visualization
+# -----------------------------------------------------------
+st.markdown("---")
+st.subheader("🎯 Risk Assessment")
+
+col_gauge, col_info = st.columns([2, 1])
 
 # Format volatility with parentheses for negative values (if any)
 def format_percent(value):
@@ -586,17 +635,6 @@ def format_percent(value):
         return f"{value:.2f}%"
     else:
         return f"({abs(value):.2f}%)"
-
-col1.metric("TVL (USD)", f"${tvl_usd:,.0f}")
-col2.metric("24h Volatility", format_percent(vol_24h))
-col3.metric("Audit Score", f"{audit_score:.2f}", help="0.0 (lowest) to 1.0 (highest)")
-col4.metric("7d Volatility", format_percent(vol_7d))
-
-# -----------------------------------------------------------
-# 6. Risk score display with gauge visualization
-# -----------------------------------------------------------
-st.markdown("---")
-col_gauge, col_info = st.columns([2, 1])
 
 with col_gauge:
     st.subheader("Risk Score")
@@ -719,12 +757,6 @@ with col_info:
     
     st.dataframe(risk_breakdown, use_container_width=True, hide_index=True)
     
-    # Additional info
-    st.markdown("---")
-    st.metric("Current Price", f"${current_price:.4f}")
-    if market_cap > 0:
-        st.metric("Market Cap", f"${market_cap:,.0f}")
-    
     # Delta explanation
     delta_from_mid = risk_score - 50
     delta_percent_from_mid = (delta_from_mid / 50) * 100
@@ -741,7 +773,20 @@ with col_info:
                unsafe_allow_html=True)
 
 # -----------------------------------------------------------
-# 7. Historical TVL Chart
+# 7. Additional metrics section
+# -----------------------------------------------------------
+st.markdown("---")
+st.subheader("📈 Additional Metrics")
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("TVL (USD)", f"${tvl_usd:,.0f}", help="Total Value Locked in the protocol")
+col2.metric("24h Volatility", format_percent(vol_24h), help="24-hour price change percentage")
+col3.metric("7d Volatility", format_percent(vol_7d), help="7-day price change percentage")
+col4.metric("Audit Score", f"{audit_score:.2f}", help="Security audit score (0.0 = lowest, 1.0 = highest)")
+
+# -----------------------------------------------------------
+# 8. Historical TVL Chart
 # -----------------------------------------------------------
 if tvl_history is not None and len(tvl_history) > 0:
     st.markdown("---")
@@ -771,7 +816,7 @@ else:
     logger.warning(f"No TVL history data available for {protocol_name}")
 
 # -----------------------------------------------------------
-# 8. Scenario Analysis: Volatility Shock
+# 9. Scenario Analysis: Volatility Shock
 # -----------------------------------------------------------
 st.markdown("---")
 st.subheader("🔬 Scenario Analysis: Volatility Shock")
@@ -803,7 +848,7 @@ with col_table:
     st.dataframe(scenario_data, use_container_width=True, hide_index=True)
 
 # -----------------------------------------------------------
-# 9. Protocol Comparison (if enabled)
+# 10. Protocol Comparison (if enabled)
 # -----------------------------------------------------------
 if compare_mode:
     st.markdown("---")
@@ -834,13 +879,19 @@ if compare_mode:
                 proto = PROTOCOLS[proto_name]
                 
                 try:
-                    # Fetch TVL with delay between calls to avoid rate limiting
-                    delay_tvl = 1.5 if idx > 0 else 0  # Don't delay for first protocol (already fetched)
+                    # Fetch TVL with longer delay between calls to avoid rate limiting
+                    # First protocol already fetched, but add delay for subsequent ones
+                    if idx > 0:
+                        delay_tvl = 2.5 + (idx * 0.5)  # Progressive delay: 2.5s, 3s, 3.5s, etc.
+                        logger.debug(f"Adding {delay_tvl}s delay before TVL request for {proto_name}")
+                    else:
+                        delay_tvl = 0  # First protocol already fetched
+                    
                     comp_tvl = fetch_tvl(proto["defillama_slug"], delay_before_request=delay_tvl)
                     
-                    # Add small delay before volatility call to avoid rate limiting
-                    time.sleep(1)
-                    comp_vol = fetch_volatility(proto["coingecko_id"], delay_before_request=0.5)
+                    # Add delay before volatility call to avoid rate limiting
+                    time.sleep(2)  # Increased from 1s to 2s
+                    comp_vol = fetch_volatility(proto["coingecko_id"], delay_before_request=1.0)  # Increased from 0.5s to 1s
                     
                     # Validate data before proceeding
                     if comp_tvl == 0:
@@ -911,7 +962,7 @@ if compare_mode:
             logger.error("Comparison failed: No protocols successfully fetched")
 
 # -----------------------------------------------------------
-# 10. AI-style explanation (enhanced)
+# 11. AI-style explanation (enhanced)
 # -----------------------------------------------------------
 st.markdown("---")
 with st.expander("🤖 AI-Style Explanation"):
@@ -940,7 +991,7 @@ with st.expander("🤖 AI-Style Explanation"):
     """)
 
 # -----------------------------------------------------------
-# 11. Methodology explanation
+# 12. Methodology explanation
 # -----------------------------------------------------------
 with st.expander("📖 How Risk Score is Calculated"):
     st.markdown("""
