@@ -180,12 +180,20 @@ st.sidebar.info(
 # 2. Helper functions to call APIs
 # -----------------------------------------------------------
 
-@st.cache_data(ttl=600)  # Increased cache TTL to 10 minutes to reduce API calls
-def fetch_tvl(slug: str):
+@st.cache_data(ttl=600, show_spinner=False)  # Increased cache TTL to 10 minutes to reduce API calls
+def fetch_tvl(slug: str, delay_before_request: float = 0):
     """
     Get protocol-level TVL from DeFiLlama with retry logic.
     Docs: https://defillama.com/docs/api
+    
+    Args:
+        slug: Protocol slug for DeFiLlama API
+        delay_before_request: Optional delay in seconds before making request (for rate limiting)
     """
+    if delay_before_request > 0:
+        logger.debug(f"Delaying {delay_before_request}s before TVL request for {slug} to avoid rate limiting")
+        time.sleep(delay_before_request)
+    
     url = f"https://api.llama.fi/protocol/{slug}"
     logger.info(f"Fetching TVL data for protocol: {slug}")
     logger.debug(f"TVL API URL: {url}")
@@ -294,7 +302,7 @@ def fetch_tvl(slug: str):
     logger.error(f"Failed to fetch TVL for {slug} after {max_retries} attempts")
     return 0
 
-@st.cache_data(ttl=600)  # Increased cache TTL to 10 minutes
+@st.cache_data(ttl=600, show_spinner=False)  # Increased cache TTL to 10 minutes
 def fetch_tvl_history(slug: str):
     """Fetch historical TVL data for charting with retry logic"""
     url = f"https://api.llama.fi/protocol/{slug}"
@@ -354,12 +362,20 @@ def fetch_tvl_history(slug: str):
     
     return None
 
-@st.cache_data(ttl=600)  # Increased cache TTL to 10 minutes
-def fetch_volatility(coingecko_id: str):
+@st.cache_data(ttl=600, show_spinner=False)  # Increased cache TTL to 10 minutes
+def fetch_volatility(coingecko_id: str, delay_before_request: float = 0):
     """
     Fetch comprehensive volatility and market data from CoinGecko with retry logic.
     Docs: https://www.coingecko.com/en/api/documentation
+    
+    Args:
+        coingecko_id: CoinGecko coin ID
+        delay_before_request: Optional delay in seconds before making request (for rate limiting)
     """
+    if delay_before_request > 0:
+        logger.debug(f"Delaying {delay_before_request}s before volatility request for {coingecko_id} to avoid rate limiting")
+        time.sleep(delay_before_request)
+    
     url = f"https://api.coingecko.com/api/v3/coins/{coingecko_id}"
     params = {
         "localization": "false",
@@ -483,7 +499,7 @@ st.header(f"📊 Risk Analysis: {protocol_name}")
 logger.info(f"Starting data fetch for {protocol_name}...")
 fetch_start_time = time.time()
 
-with st.spinner("Fetching real-time data..."):
+with st.spinner("Processing..."):
     tvl_usd = fetch_tvl(proto_conf["defillama_slug"])
     vol_data = fetch_volatility(proto_conf["coingecko_id"])
     tvl_history = fetch_tvl_history(proto_conf["defillama_slug"])
@@ -562,10 +578,19 @@ logger.info(f"Final risk score for {protocol_name}: {risk_score:.2f}")
 # 5. Display main metrics
 # -----------------------------------------------------------
 col1, col2, col3, col4 = st.columns(4)
+
+# Format volatility with parentheses for negative values (if any)
+def format_percent(value):
+    """Format percentage with parentheses for negative values"""
+    if value >= 0:
+        return f"{value:.2f}%"
+    else:
+        return f"({abs(value):.2f}%)"
+
 col1.metric("TVL (USD)", f"${tvl_usd:,.0f}")
-col2.metric("24h Volatility (%)", f"{vol_24h:.2f}")
-col3.metric("Audit Score", f"{audit_score:.2f}")
-col4.metric("7d Volatility (%)", f"{vol_7d:.2f}")
+col2.metric("24h Volatility", format_percent(vol_24h))
+col3.metric("Audit Score", f"{audit_score:.2f}", help="0.0 (lowest) to 1.0 (highest)")
+col4.metric("7d Volatility", format_percent(vol_7d))
 
 # -----------------------------------------------------------
 # 6. Risk score display with gauge visualization
@@ -587,22 +612,53 @@ with col_gauge:
         risk_level = "High Risk"
         color = "#dc3545"
     
+    # Calculate delta as percentage change from reference (50 = midpoint)
+    reference = 50
+    delta_value = risk_score - reference
+    delta_percent = (delta_value / reference) * 100
+    
+    # Format delta: show as percentage with parentheses for negative
+    if delta_percent >= 0:
+        delta_text = f"+{delta_percent:.1f}%"
+        delta_color = "inverse"  # Red for increase in risk (bad)
+    else:
+        delta_text = f"({abs(delta_percent):.1f}%)"  # Parentheses for negative
+        delta_color = "normal"  # Green for decrease in risk (good)
+    
     fig_gauge = go.Figure(go.Indicator(
         mode = "gauge+number+delta",
         value = risk_score,
         domain = {'x': [0, 1], 'y': [0, 1]},
         title = {'text': f"<b>Risk Score</b><br><span style='font-size:0.8em'>{risk_level}</span>", 'font': {'size': 20}},
-        delta = {'reference': 50, 'position': "top"},
+        delta = {
+            'reference': reference,
+            'position': "top",
+            'valueformat': ".1f",
+            'relative': True,  # Show as percentage
+            'increasing': {'color': color},  # Higher risk = red
+            'decreasing': {'color': "#28a745"}  # Lower risk = green
+        },
+        number = {
+            'valueformat': ".1f",
+            'suffix': " pts"
+        },
         gauge = {
-            'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'axis': {
+                'range': [None, 100],
+                'tickwidth': 1,
+                'tickcolor': "darkblue",
+                'tickmode': 'linear',
+                'dtick': 20,
+                'tick0': 0
+            },
             'bar': {'color': color, 'thickness': 0.3},
             'bgcolor': "white",
             'borderwidth': 2,
             'bordercolor': "gray",
             'steps': [
-                {'range': [0, 30], 'color': "#e8f5e9"},
-                {'range': [30, 60], 'color': "#fff9c4"},
-                {'range': [60, 100], 'color': "#ffebee"}
+                {'range': [0, 30], 'color': "#e8f5e9", 'thickness': 0.05},
+                {'range': [30, 60], 'color': "#fff9c4", 'thickness': 0.05},
+                {'range': [60, 100], 'color': "#ffebee", 'thickness': 0.05}
             ],
             'threshold': {
                 'line': {'color': "red", 'width': 4},
@@ -612,10 +668,22 @@ with col_gauge:
         }
     ))
     
+    # Add subtitle with delta explanation and layout settings
     fig_gauge.update_layout(
-        height=350,
-        margin=dict(l=20, r=20, t=80, b=20),
-        paper_bgcolor="white"
+        height=400,
+        margin=dict(l=20, r=20, t=80, b=60),  # Increased bottom margin for subtitle
+        paper_bgcolor="white",
+        annotations=[
+            dict(
+                text=f"vs. Midpoint (50): {delta_text}",
+                x=0.5,
+                y=-0.1,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(size=12, color="gray")
+            )
+        ]
     )
     
     st.plotly_chart(fig_gauge, use_container_width=True)
@@ -656,6 +724,21 @@ with col_info:
     st.metric("Current Price", f"${current_price:.4f}")
     if market_cap > 0:
         st.metric("Market Cap", f"${market_cap:,.0f}")
+    
+    # Delta explanation
+    delta_from_mid = risk_score - 50
+    delta_percent_from_mid = (delta_from_mid / 50) * 100
+    if delta_percent_from_mid >= 0:
+        delta_explanation = f"+{delta_percent_from_mid:.1f}% vs. midpoint (50)"
+        delta_color_class = "text-danger"
+    else:
+        delta_explanation = f"({abs(delta_percent_from_mid):.1f}%) vs. midpoint (50)"
+        delta_color_class = "text-success"
+    
+    st.markdown(f"<small><b>Delta:</b> {delta_explanation}<br>"
+               f"<span style='color: {'red' if delta_percent_from_mid >= 0 else 'green'}'>"
+               f"{'Higher risk' if delta_percent_from_mid >= 0 else 'Lower risk'} than midpoint</span></small>",
+               unsafe_allow_html=True)
 
 # -----------------------------------------------------------
 # 7. Historical TVL Chart
@@ -735,51 +818,97 @@ if compare_mode:
     if selected_protocols:
         logger.info(f"Starting protocol comparison: {[protocol_name] + selected_protocols}")
         comparison_data = []
+        all_protocols = [protocol_name] + selected_protocols
         
-        with st.spinner("Fetching comparison data..."):
-            for proto_name in [protocol_name] + selected_protocols:
+        # Create progress bar for comparison
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        with st.spinner("Processing..."):
+            for idx, proto_name in enumerate(all_protocols):
+                progress = (idx + 1) / len(all_protocols)
+                progress_bar.progress(progress)
+                status_text.text(f"Processing {proto_name} ({idx + 1}/{len(all_protocols)})...")
+                
                 logger.debug(f"Fetching comparison data for {proto_name}")
                 proto = PROTOCOLS[proto_name]
-                comp_tvl = fetch_tvl(proto["defillama_slug"])
-                comp_vol = fetch_volatility(proto["coingecko_id"])
-                comp_audit = proto["audit_score"]
-                comp_risk = compute_risk_score(comp_tvl, comp_vol["composite_volatility"], comp_audit)
                 
-                comparison_data.append({
-                    "Protocol": proto_name,
-                    "Risk Score": comp_risk,
-                    "TVL (USD)": comp_tvl,
-                    "24h Volatility (%)": comp_vol["volatility_24h"],
-                    "Audit Score": comp_audit
-                })
-                logger.debug(f"Added comparison data for {proto_name}: Risk={comp_risk:.2f}")
+                try:
+                    # Fetch TVL with delay between calls to avoid rate limiting
+                    delay_tvl = 1.5 if idx > 0 else 0  # Don't delay for first protocol (already fetched)
+                    comp_tvl = fetch_tvl(proto["defillama_slug"], delay_before_request=delay_tvl)
+                    
+                    # Add small delay before volatility call to avoid rate limiting
+                    time.sleep(1)
+                    comp_vol = fetch_volatility(proto["coingecko_id"], delay_before_request=0.5)
+                    
+                    # Validate data before proceeding
+                    if comp_tvl == 0:
+                        logger.warning(f"Skipping {proto_name}: TVL fetch failed")
+                        status_text.warning(f"⚠️ Skipped {proto_name}: Could not fetch TVL")
+                        continue
+                    
+                    if comp_vol["composite_volatility"] == 0:
+                        logger.warning(f"Skipping {proto_name}: Volatility fetch failed")
+                        status_text.warning(f"⚠️ Skipped {proto_name}: Could not fetch volatility")
+                        continue
+                    
+                    comp_audit = proto["audit_score"]
+                    comp_risk = compute_risk_score(comp_tvl, comp_vol["composite_volatility"], comp_audit)
+                    
+                    comparison_data.append({
+                        "Protocol": proto_name,
+                        "Risk Score": comp_risk,
+                        "TVL (USD)": comp_tvl,
+                        "24h Volatility (%)": comp_vol["volatility_24h"],
+                        "Audit Score": comp_audit
+                    })
+                    logger.debug(f"Added comparison data for {proto_name}: Risk={comp_risk:.2f}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {proto_name} for comparison: {type(e).__name__} - {str(e)}")
+                    status_text.warning(f"⚠️ Error fetching data for {proto_name}, skipping...")
+                    continue
+            
+            # Clear progress indicators
+            progress_bar.empty()
+            status_text.empty()
         
-        try:
-            comp_df = pd.DataFrame(comparison_data)
-            
-            # Sort by risk score
-            comp_df = comp_df.sort_values("Risk Score")
-            logger.info(f"Comparison completed for {len(comparison_data)} protocols")
-            
-            # Display comparison table
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
-            
-            # Comparison chart
-            fig_compare = px.bar(
-                comp_df,
-                x="Protocol",
-                y="Risk Score",
-                color="Risk Score",
-                color_continuous_scale=["green", "yellow", "red"],
-                title="Risk Score Comparison",
-                labels={"Risk Score": "Risk Score (0-100)"}
-            )
-            fig_compare.update_layout(height=400, showlegend=False)
-            st.plotly_chart(fig_compare, use_container_width=True)
-            logger.debug("Comparison chart rendered successfully")
-        except Exception as e:
-            logger.exception(f"Error rendering comparison: {type(e).__name__} - {str(e)}")
-            st.error(f"Error rendering comparison: {e}")
+        if comparison_data:
+            try:
+                comp_df = pd.DataFrame(comparison_data)
+                
+                # Sort by risk score
+                comp_df = comp_df.sort_values("Risk Score")
+                logger.info(f"Comparison completed for {len(comparison_data)} protocols")
+                
+                # Show success message if some were skipped
+                if len(comparison_data) < len(all_protocols):
+                    skipped_count = len(all_protocols) - len(comparison_data)
+                    st.info(f"✅ Showing {len(comparison_data)} protocols. {skipped_count} protocol(s) skipped due to API errors.")
+                
+                # Display comparison table
+                st.dataframe(comp_df, use_container_width=True, hide_index=True)
+                
+                # Comparison chart
+                fig_compare = px.bar(
+                    comp_df,
+                    x="Protocol",
+                    y="Risk Score",
+                    color="Risk Score",
+                    color_continuous_scale=["green", "yellow", "red"],
+                    title="Risk Score Comparison",
+                    labels={"Risk Score": "Risk Score (0-100)"}
+                )
+                fig_compare.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig_compare, use_container_width=True)
+                logger.debug("Comparison chart rendered successfully")
+            except Exception as e:
+                logger.exception(f"Error rendering comparison: {type(e).__name__} - {str(e)}")
+                st.error(f"Error rendering comparison: {e}")
+        else:
+            st.error("❌ Could not fetch data for any protocols. Please try again later or check API availability.")
+            logger.error("Comparison failed: No protocols successfully fetched")
 
 # -----------------------------------------------------------
 # 10. AI-style explanation (enhanced)

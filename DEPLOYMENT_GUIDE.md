@@ -21,7 +21,7 @@
 
 3. **Push code to GitHub:**
    ```bash
-   git remote add origin https://github.com/YOUR_USERNAME/defi-risk-gauge.git
+   git remote add origin https://github.com/swatisahu04/defi-risk-gauge.git
    git branch -M main
    git push -u origin main
    ```
