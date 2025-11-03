@@ -605,10 +605,8 @@ risk_score = compute_risk_score(tvl_usd, composite_vol, audit_score)
 logger.info(f"Final risk score for {protocol_name}: {risk_score:.2f}")
 
 # -----------------------------------------------------------
-# 5. Display main product characteristics at the top
+# 5. Display Current Price and Market Cap at the top
 # -----------------------------------------------------------
-st.subheader("📊 Main Characteristics")
-
 col_price, col_mcap = st.columns(2)
 
 with col_price:
@@ -626,7 +624,7 @@ with col_mcap:
 st.markdown("---")
 st.subheader("🎯 Risk Assessment")
 
-col_gauge, col_info = st.columns([2, 1])
+col_gauge, col_info = st.columns([1, 1])
 
 # Format volatility with parentheses for negative values (if any)
 def format_percent(value):
@@ -707,13 +705,21 @@ with col_gauge:
     ))
     
     # Add subtitle with delta explanation and layout settings
+    # Format delta text with clearer indication
+    if delta_percent >= 0:
+        delta_display = f"+{delta_percent:.1f}%"
+        delta_label = "Higher risk"
+    else:
+        delta_display = f"({abs(delta_percent):.1f}%)"  # Parentheses for negative
+        delta_label = "Lower risk"
+    
     fig_gauge.update_layout(
         height=400,
         margin=dict(l=20, r=20, t=80, b=60),  # Increased bottom margin for subtitle
         paper_bgcolor="white",
         annotations=[
             dict(
-                text=f"vs. Midpoint (50): {delta_text}",
+                text=f"vs. Midpoint (50): {delta_display}",
                 x=0.5,
                 y=-0.1,
                 xref="paper",
@@ -749,28 +755,71 @@ with col_info:
     vol_risk_score = min(composite_vol, 100)
     protocol_risk_score = (1 - audit_score) * 100
     
-    risk_breakdown = pd.DataFrame({
+    # Create visual bar chart for risk breakdown
+    breakdown_data = pd.DataFrame({
         "Component": ["Market Risk", "Liquidity Risk", "Protocol Risk"],
-        "Score": [f"{vol_risk_score:.1f}", f"{tvl_risk_score:.1f}", f"{protocol_risk_score:.1f}"],
+        "Risk Score": [vol_risk_score, tvl_risk_score, protocol_risk_score],
         "Weight": ["40%", "30%", "30%"]
     })
     
-    st.dataframe(risk_breakdown, use_container_width=True, hide_index=True)
+    # Create horizontal bar chart
+    fig_breakdown = px.bar(
+        breakdown_data,
+        x="Risk Score",
+        y="Component",
+        orientation='h',
+        color="Risk Score",
+        color_continuous_scale=["green", "yellow", "red"],
+        title="Component Risk Scores",
+        labels={"Risk Score": "Risk Score (0-100)", "Component": ""},
+        text="Risk Score"
+    )
     
-    # Delta explanation
+    fig_breakdown.update_traces(
+        texttemplate='%{text:.1f}',
+        textposition='outside',
+        marker=dict(line=dict(color='darkgray', width=1))
+    )
+    
+    fig_breakdown.update_layout(
+        height=400,
+        xaxis=dict(range=[0, 100], title="Risk Score (0-100)"),
+        yaxis=dict(title=""),
+        showlegend=False,
+        margin=dict(l=20, r=20, t=60, b=20),
+        paper_bgcolor="white",
+        plot_bgcolor="white"
+    )
+    
+    st.plotly_chart(fig_breakdown, use_container_width=True)
+    
+    # Delta explanation below the chart
     delta_from_mid = risk_score - 50
     delta_percent_from_mid = (delta_from_mid / 50) * 100
-    if delta_percent_from_mid >= 0:
-        delta_explanation = f"+{delta_percent_from_mid:.1f}% vs. midpoint (50)"
-        delta_color_class = "text-danger"
-    else:
-        delta_explanation = f"({abs(delta_percent_from_mid):.1f}%) vs. midpoint (50)"
-        delta_color_class = "text-success"
     
-    st.markdown(f"<small><b>Delta:</b> {delta_explanation}<br>"
-               f"<span style='color: {'red' if delta_percent_from_mid >= 0 else 'green'}'>"
-               f"{'Higher risk' if delta_percent_from_mid >= 0 else 'Lower risk'} than midpoint</span></small>",
-               unsafe_allow_html=True)
+    # Format delta with clear positive/negative indication
+    if delta_percent_from_mid >= 0:
+        delta_display = f"+{delta_percent_from_mid:.1f}%"
+        delta_sign = "↗️"
+        delta_color = "red"
+        delta_meaning = "Higher risk"
+    else:
+        delta_display = f"({abs(delta_percent_from_mid):.1f}%)"  # Parentheses for negative
+        delta_sign = "↘️"
+        delta_color = "green"
+        delta_meaning = "Lower risk"
+    
+    st.markdown(
+        f"""
+        <div style="background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px;">
+            <strong>Delta Change:</strong> {delta_display} {delta_sign}<br>
+            <small style="color: {delta_color};">
+                {delta_meaning} vs. midpoint (50)
+            </small>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # -----------------------------------------------------------
 # 7. Additional metrics section
